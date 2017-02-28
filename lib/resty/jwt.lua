@@ -1,10 +1,11 @@
 local cjson = require "cjson.safe"
+
 local aes = require "resty.aes"
 local evp = require "resty.evp"
 local hmac = require "resty.hmac"
 local resty_random = require "resty.random"
 
-local _M = {_VERSION="0.1.5"}
+local _M = {_VERSION="0.1.9"}
 local mt = {__index=_M}
 
 local string_match= string.match
@@ -12,11 +13,13 @@ local string_rep = string.rep
 local string_format = string.format
 local string_sub = string.sub
 local string_byte = string.byte
+local string_char = string.char
 local table_concat = table.concat
 local ngx_encode_base64 = ngx.encode_base64
 local ngx_decode_base64 = ngx.decode_base64
 local cjson_encode = cjson.encode
 local cjson_decode = cjson.decode
+local tostring = tostring
 
 -- define string constants to avoid string garbage collection
 local str_const = {
@@ -55,9 +58,10 @@ local str_const = {
   HS256 = "HS256",
   HS512 = "HS512",
   RS256 = "RS256",
-  A128CBC_HS256 = "A128CBC_HS256",
-  A256CBC_HS512 = "A256CBC_HS512",
-  DIR = "DIR",
+  RS512 = "RS512",
+  A128CBC_HS256 = "A128CBC-HS256",
+  A256CBC_HS512 = "A256CBC-HS512",
+  DIR = "dir",
   reason = "reason",
   verified = "verified",
   number = "number",
@@ -180,21 +184,26 @@ end
 --@param secret key
 --@return secret key, mac key and encryption key
 local function derive_keys(enc, secret_key)
-  local key_size_bytes = 16
+  local mac_key_len, enc_key_len = 16, 16
+
   if enc == str_const.A128CBC_HS256 then
-    key_size_bytes = 16
+    mac_key_len, enc_key_len = 16, 16
   elseif enc == str_const.A256CBC_HS512 then
-    key_size_bytes = 32
+    mac_key_len, enc_key_len = 32, 32
   end
+
+  local secret_key_len = mac_key_len + enc_key_len
+
   if not secret_key then
-    secret_key =  resty_random.bytes(key_size_bytes,true)
+    secret_key =  resty_random.bytes(secret_key_len, true)
   end
-  if #secret_key ~= key_size_bytes then
-    error({reason="The pre-shared content key must be ".. key_size_bytes})
+
+  if #secret_key ~= secret_key_len then
+    error({reason="The pre-shared content key must be ".. secret_key_len})
   end
-  local derived_key_size = key_size_bytes / 2
-  mac_key = string_sub(secret_key, 1, derived_key_size)
-  enc_key =string_sub(secret_key, derived_key_size)
+
+  local mac_key = string_sub(secret_key, 1, mac_key_len)
+  local enc_key = string_sub(secret_key, enc_key_len + 1)
   return secret_key, mac_key, enc_key
 end
 
@@ -209,8 +218,9 @@ local function parse_jwe(preshared_key, encoded_header, encoded_encrypted_key, e
     error({reason="invalid header: " .. encoded_header})
   end
 
+  local key, mac_key, enc_key = derive_keys(header.enc, preshared_key)
+
   -- use preshared key if given otherwise decrypt the encoded key
-  local key = preshared_key
   if not preshared_key then
     local encrypted_key = _M:jwt_decode(encoded_encrypted_key)
     if header.alg == str_const.DIR then
@@ -227,15 +237,14 @@ local function parse_jwe(preshared_key, encoded_header, encoded_encrypted_key, e
     internal = {
       encoded_header = encoded_header,
       cipher_text = cipher_text,
-      key=key,
+      key = key,
       iv = iv
     },
     header=header,
     signature=_M:jwt_decode(encoded_auth_tag)
   }
 
-
-  local json_payload, err = decrypt_payload(key, cipher_text, header.enc, iv )
+  local json_payload, err = decrypt_payload(enc_key, cipher_text, header.enc, iv)
   if not json_payload then
     basic_jwe.reason = err
 
@@ -345,8 +354,11 @@ _M.alg_whitelist = nil
 
 --- Returns the list of default validations that will be
 --- applied upon the verification of a jwt.
-function _M.get_default_validation_options(self)
-  return { }
+function _M.get_default_validation_options(self, jwt_obj)
+  return {
+    [str_const.require_exp_claim]=jwt_obj[exp] ~= nil,
+    [str_const.require_nbf_claim]=jwt_obj[nbf] ~= nil
+  }
 end
 
 --- Set a function used to retrieve the content of x5u urls
@@ -367,31 +379,49 @@ end
 
 _M.x5u_content_retriever = nil
 
+-- https://tools.ietf.org/html/rfc7516#appendix-B.3
+-- TODO: do it in lua way
+local function binlen(s)
+  if type(s) ~= 'string' then return end
+
+  local len = 8 * #s
+
+  return string_char(len / 0x0100000000000000 % 0x100)
+      .. string_char(len / 0x0001000000000000 % 0x100)
+      .. string_char(len / 0x0000010000000000 % 0x100)
+      .. string_char(len / 0x0000000100000000 % 0x100)
+      .. string_char(len / 0x0000000001000000 % 0x100)
+      .. string_char(len / 0x0000000000010000 % 0x100)
+      .. string_char(len / 0x0000000000000100 % 0x100)
+      .. string_char(len / 0x0000000000000001 % 0x100)
+end
+
 --@function sign jwe payload
 --@param secret key : if used pre-shared or RSA key
 --@param  jwe payload
 --@return jwe token
 local function sign_jwe(secret_key, jwt_obj)
+  local header = jwt_obj.header
+  local enc = header.enc
 
-  local enc = jwt_obj.header.enc
   local key, mac_key, enc_key = derive_keys(enc, secret_key)
   local json_payload = cjson_encode(jwt_obj.payload)
-  local cipher_text, iv, err = encrypt_payload( key, json_payload, jwt_obj.header.enc )
+  local cipher_text, iv, err = encrypt_payload(enc_key, json_payload, enc)
   if err then
     error({reason="error while encrypting payload. Error: " .. err})
   end
-  local alg = jwt_obj.header.alg
+  local alg = header.alg
 
   if alg ~= str_const.DIR then
-    error({reason="unsupported alg: " .. alg})
+    error({reason="unsupported alg: " .. tostring(alg)})
   end
   -- remove type
-  if jwt_obj.header.typ then
-    jwt_obj.header.typ = nil
+  if header.typ then
+    header.typ = nil
   end
-  local encoded_header = _M:jwt_encode(jwt_obj.header)
+  local encoded_header = _M:jwt_encode(header)
 
-  local encoded_header_length = #encoded_header  -- FIXME  : might be missin this logic
+  local encoded_header_length = binlen(encoded_header)
   local mac_input = table_concat({encoded_header , iv, cipher_text , encoded_header_length})
   local mac = hmac_digest(enc, mac_key, mac_input)
   -- TODO: implement logic for creating enc key and mac key and then encrypt key
@@ -506,13 +536,14 @@ local function verify_jwe_obj(secret, jwt_obj)
   local key, mac_key, enc_key = derive_keys(jwt_obj.header.enc, jwt_obj.internal.key)
   local encoded_header = jwt_obj.internal.encoded_header
 
-  local encoded_header_length = #encoded_header -- FIXME: Not sure how to get this
+  local encoded_header_length = binlen(encoded_header)
   local mac_input = table_concat({encoded_header , jwt_obj.internal.iv, jwt_obj.internal.cipher_text , encoded_header_length})
   local mac = hmac_digest(jwt_obj.header.enc, mac_key,  mac_input)
   local auth_tag = string_sub(mac, 1, #mac/2)
 
   if auth_tag ~= jwt_obj.signature then
-    jwt_obj[str_const.reason] = "signature mismatch: " .. jwt_obj[str_const.signature]
+    jwt_obj[str_const.reason] = "signature mismatch: " ..
+    tostring(jwt_obj[str_const.signature])
 
   end
   jwt_obj.internal = nil
@@ -646,6 +677,9 @@ end
 -- Validates the claims for the given (parsed) object
 local function validate_claims(self, jwt_obj, ...)
   local claim_specs = {...}
+  if #claim_specs == 0 then
+    table.insert(claim_specs, _M:get_default_validation_options(jwt_obj))
+  end
 
   if jwt_obj[str_const.reason] ~= nil then
     return false
@@ -704,8 +738,6 @@ function _M.verify_jwt_obj(self, secret, jwt_obj, ...)
 
   local jwt_str = string_format(str_const.regex_jwt_join_str, jwt_obj.raw_header , jwt_obj.raw_payload , jwt_obj.signature)
 
-
-
   if self.alg_whitelist ~= nil then
     if self.alg_whitelist[alg] == nil then
       return {verified=false, reason="whitelist unsupported alg: " .. alg}
@@ -721,8 +753,8 @@ function _M.verify_jwt_obj(self, secret, jwt_obj, ...)
       -- signature check
       jwt_obj[str_const.reason] = "signature mismatch: " .. jwt_obj[str_const.signature]
     end
-  elseif alg == str_const.RS256 then
-    local cert
+  elseif alg == str_const.RS256 or alg == str_const.RS512 then
+    local cert, err
     if self.trusted_certs_file ~= nil then
       local cert_str = extract_certificate(jwt_obj, self.x5u_content_retriever)
       if not cert_str then
@@ -773,7 +805,14 @@ function _M.verify_jwt_obj(self, secret, jwt_obj, ...)
       return jwt_obj
     end
 
-    local verified, err = verifier:verify(message, sig, evp.CONST.SHA256_DIGEST)
+    local verified = false
+    local err = "verify error: reason unknown"
+
+    if alg == str_const.RS256 then
+      verified, err = verifier:verify(message, sig, evp.CONST.SHA256_DIGEST)
+    elseif alg == str_const.RS512 then
+      verified, err = verifier:verify(message, sig, evp.CONST.SHA512_DIGEST)
+    end
     if not verified then
       jwt_obj[str_const.reason] = err
     end
@@ -791,7 +830,7 @@ end
 
 
 function _M.verify(self, secret, jwt_str, ...)
-  jwt_obj = _M.load_jwt(self, jwt_str, secret)
+  local jwt_obj = _M.load_jwt(self, jwt_str, secret)
   if not jwt_obj.valid then
     return {verified=false, reason=jwt_obj[str_const.reason]}
   end
